@@ -38,11 +38,13 @@
 #define ROM_GPIODATA *((volatile int16_t *)0x080000C4)
 #define ROM_GPIODIR  *((volatile int16_t *)0x080000C6)
 #define ROM_GPIOCNT  *((volatile int16_t *)0x080000C8)
-#define GPIO_IRQ	 0x0100
+#define GPIO_IRQ     0x0100
 
 //#define ANALOG
+#define COLORPRINTER
 
 enum {
+	/* JoyBus Commands */
 	CMD_ID = 0x00,
 	CMD_STATUS,
 	CMD_READ,
@@ -51,12 +53,14 @@ enum {
 	CMD_GBWRITE = 0x14,
 	CMD_RESET = 0xFF,
 
-	GBP_INIT = 0x01,
-	GBP_PRINT = 0x02,
-	GBP_COPY = 0x04,
-	GBP_AFTER = 0x06,
-	GBP_STOP = 0x08,
-	GBP_NOP = 0x0F
+	/* Game Boy Printer (Color) Commands */
+	GBPCMD_INIT = 0x01,
+	GBPCMD_PRINT = 0x02,
+	GBPCMD_PREP = 0x02,
+	GBPCMD_COPY = 0x04,
+	GBPCMD_PRINTCOLOR = 0x06,
+	GBPCMD_STOP = 0x08,
+	GBPCMD_NOP = 0x0F
 };
 
 static struct {
@@ -65,6 +69,16 @@ static struct {
 } id = {0x0300, 0x00};	/* 64GB Cable (Game Boy Printer Cartridge) */
 
 static uint8_t buffer[128];
+static uint8_t buffer_status[33];
+static uint8_t buffer_link[33];
+
+static int32_t GBPDATA;  //GBP Data Length
+static uint8_t GBPCMD;    //GBP Command
+static uint8_t GBPSTAT;   //GBP Status
+static uint8_t GBPSTAT2;   //GBP Status (to update)
+static int8_t GBPCOUNT;
+
+static uint8_t GBPACKET_SIZE;	//64GB Cable Packet Size
 
 uint8_t crc8_lut[256] = {
 	0x00, 0x85, 0x8F, 0x0A, 0x9B, 0x1E, 0x14, 0x91, 0xB3, 0x36, 0x3C, 0xB9, 0x28, 0xAD, 0xA7, 0x22,
@@ -85,7 +99,7 @@ uint8_t crc8_lut[256] = {
 	0xAF, 0x2A, 0x20, 0xA5, 0x34, 0xB1, 0xBB, 0x3E, 0x1C, 0x99, 0x93, 0x16, 0x87, 0x02, 0x08, 0x8D,
 };
 
-static uint8_t crc8(uint8_t* ptr) {
+static uint8_t crc8(uint8_t *ptr) {
 	uint8_t crc = 0;
 
 	for (int i = 0; i < 32; i++) {
@@ -98,10 +112,6 @@ static uint8_t crc8(uint8_t* ptr) {
 
 void SISetResponse(const void *buf, unsigned bits);
 int SIGetCommand(void *buf, unsigned bits);
-
-#define LINK_SEND 0x3
-#define LINK_REP_C0 0x30
-#define LINK_REP_F0 0x30+0x21
 
 int main(void)
 {
@@ -119,6 +129,12 @@ int main(void)
 	SoundBias(0);
 	Halt();
 
+	GBPDATA = 0;
+	GBPSTAT = 0;
+	GBPSTAT2 = 0;
+	GBPCMD = 0;
+	GBPCOUNT = -1;
+
 	while (true) {
 		int length = SIGetCommand(buffer, sizeof(buffer) * 8 + 1);
 		if (length < 9) continue;
@@ -135,12 +151,12 @@ int main(void)
 					if (buffer[1] == 0xC0)
 					{
 						/* Communication Status */
-						SISetResponse(&buffer[LINK_REP_C0], 264);
+						SISetResponse(buffer_status, 264);
 					}
 					else if (buffer[1] == 0xF0)
 					{
 						/* Game Boy Link Communication Recv */
-						SISetResponse(&buffer[LINK_REP_F0], 264);
+						SISetResponse(buffer_link, 264);
 					}
 				}
 				break;
@@ -148,24 +164,93 @@ int main(void)
 				/* RAW: 23 01 - 14 CC LL */
 				if (length == 281) {
 					/* 0x01 byte to send */
-					buffer[LINK_SEND + 0x20] = crc8(&buffer[LINK_SEND]);
-					SISetResponse(&buffer[LINK_SEND + 0x20], 8);
+					buffer[0x23] = crc8(&buffer[3]);
+					SISetResponse(&buffer[0x23], 8);
 
 					/* Prepare Data Response */
 					if (buffer[1] == 0x80) {
 						/* Initialization Command */
-						for (int i = 0; i < sizeof(buffer); i++)
-							buffer[i] = 0;
+						for (int i = 0; i < sizeof(buffer_status); i++)
+							buffer_status[i] = 0;
+						for (int i = 0; i < sizeof(buffer_link); i++)
+							buffer_link[i] = 0;
 					}
 					else if (buffer[1] == 0xC0) {
 						/* Communication Configuration Command */
-						buffer[LINK_REP_C0] = 0x02;
-						buffer[LINK_REP_C0 + 0x20] = crc8(&buffer[LINK_REP_C0]);
+						GBPACKET_SIZE = buffer[4];	//Packet Size (Send/Recv)
+						buffer_status[0] = 0x02;
+						buffer_status[0x20] = crc8(buffer_status);
 					}
 					else if (buffer[1] == 0xE0) {
 						/* Game Boy Link Communication Send */
-						buffer[LINK_REP_F0 + 8] = 0x81;
-						buffer[LINK_REP_F0 + 0x20] = crc8(&buffer[LINK_REP_F0]);
+						if (GBPCMD == 0)
+						{
+							if (buffer[3] == 0x88 && buffer[4] == 0x33)
+							{
+								GBPCMD = buffer[5];
+								GBPDATA = buffer[7] | (buffer[8] << 8);
+								GBPDATA += 0x8;
+								if (GBPCMD == GBPCMD_INIT)
+								{
+									// Init
+									GBPSTAT = 0x00;
+									GBPCMD = 0x00;
+									GBPCOUNT = -1;
+								}
+								else if (GBPCMD == GBPCMD_PRINT)
+								{
+									// Start Print
+									#ifndef COLORPRINTER
+									GBPSTAT = 0x06;
+									GBPCOUNT = 50;
+									GBPSTAT2 = 0x04;
+									#endif
+								}
+								else if (GBPCMD == GBPCMD_COPY)
+								{
+									// Copy Bitmap
+									GBPSTAT = 0x08;
+								}
+								else if (GBPCMD == GBPCMD_PRINTCOLOR)
+								{
+									//Color only
+									#ifdef COLORPRINTER
+									GBPSTAT = 0x00;
+									GBPSTAT2 = 0x00;
+									#endif
+								}
+								else if (GBPCMD == GBPCMD_NOP)
+								{
+									//Nop, get Status
+									if (GBPSTAT == 0x08) GBPSTAT = 0x0C;
+								}
+								else if (GBPCMD == GBPCMD_STOP)
+								{
+									//Stop
+									GBPCOUNT = -1;
+									GBPSTAT = 0x00;
+									GBPSTAT2 = 0x00;
+								}
+							}
+						}
+
+						if (GBPCOUNT >= 0) GBPCOUNT--;
+						if (GBPCOUNT == 0) GBPSTAT = GBPSTAT2;
+						if (GBPDATA >= 0) GBPDATA -= GBPACKET_SIZE;
+
+						if (GBPDATA < 0)
+						{
+							//Game Boy Printer ID
+							#ifndef COLORPRINTER
+							buffer_link[GBPACKET_SIZE + GBPDATA] = 0x81;
+							#else
+							buffer_link[GBPACKET_SIZE + GBPDATA] = 0x82;
+							#endif
+							//Game Boy Printer Status
+							buffer_link[GBPACKET_SIZE + GBPDATA + 1] = GBPSTAT;
+							GBPCMD = 0;
+						}
+						buffer_link[0x20] = crc8(buffer_link);
 					}
 				}
 				break;
