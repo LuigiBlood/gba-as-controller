@@ -38,6 +38,7 @@
 #define ROM_GPIODATA *((volatile int16_t *)0x080000C4)
 #define ROM_GPIODIR  *((volatile int16_t *)0x080000C6)
 #define ROM_GPIOCNT  *((volatile int16_t *)0x080000C8)
+#define GPIO_IRQ	 0x0100
 
 //#define ANALOG
 
@@ -46,13 +47,22 @@ enum {
 	CMD_STATUS,
 	CMD_READ,
 	CMD_WRITE,
-	CMD_RESET = 0xFF
+	CMD_GBREAD = 0x13,
+	CMD_GBWRITE = 0x14,
+	CMD_RESET = 0xFF,
+
+	GBP_INIT = 0x01,
+	GBP_PRINT = 0x02,
+	GBP_COPY = 0x04,
+	GBP_AFTER = 0x06,
+	GBP_STOP = 0x08,
+	GBP_NOP = 0x0F
 };
 
 static struct {
 	uint16_t type;
 	uint8_t status;
-} id = {0x0005, 0x01};
+} id = {0x0300, 0x00};	/* 64GB Cable (Game Boy Printer Cartridge) */
 
 static struct {
 	struct {
@@ -159,6 +169,17 @@ uint8_t crc8_lut[256] = {
 	0xAF, 0x2A, 0x20, 0xA5, 0x34, 0xB1, 0xBB, 0x3E, 0x1C, 0x99, 0x93, 0x16, 0x87, 0x02, 0x08, 0x8D,
 };
 
+static uint8_t crc8(uint8_t* ptr) {
+	uint8_t crc = 0;
+
+	for (int i = 0; i < 32; i++) {
+		crc ^= *ptr++;
+		crc  = crc8_lut[crc];
+	}
+
+	return crc;
+}
+
 static uint8_t pak_copyto(uint16_t addr, uint8_t *src)
 {
 	uint16_t *dst = (uint16_t *)VRAM + addr;
@@ -207,6 +228,10 @@ static uint8_t crc5(uint16_t addr)
 void SISetResponse(const void *buf, unsigned bits);
 int SIGetCommand(void *buf, unsigned bits);
 
+#define LINK_SEND 0x3
+#define LINK_REP_C0 0x30
+#define LINK_REP_F0 0x30+0x21
+
 int main(void)
 {
 	RegisterRamReset(RESET_ALL_REG);
@@ -232,68 +257,45 @@ int main(void)
 			case CMD_ID:
 				if (length == 9) SISetResponse(&id, sizeof(id) * 8);
 				break;
-			case CMD_STATUS:
-				if (length == 9) {
-					unsigned buttons     = ~REG_KEYINPUT;
-					#ifndef ANALOG
-					status.buttons.a     = !!(buttons & KEY_A);
-					status.buttons.b     = !!(buttons & KEY_B);
-					status.buttons.z     = !!(buttons & KEY_SELECT);
-					status.buttons.start = !!(buttons & KEY_START);
-					status.buttons.right = !!(buttons & KEY_RIGHT);
-					status.buttons.left  = !!(buttons & KEY_LEFT);
-					status.buttons.up    = !!(buttons & KEY_UP);
-					status.buttons.down  = !!(buttons & KEY_DOWN);
-					status.buttons.r     = !!(buttons & KEY_R);
-					status.buttons.l     = !!(buttons & KEY_L);
-					#else
-					status.buttons.a     = !!(buttons & KEY_A);
-					status.buttons.b     = !!(buttons & KEY_B);
-					status.buttons.l     = !!(buttons & KEY_SELECT);
-					status.buttons.start = !!(buttons & KEY_START);
-					status.buttons.r     = !!(buttons & KEY_R);
-					status.buttons.z     = !!(buttons & KEY_L);
-
-					if (buttons & KEY_RIGHT)
-						status.stick.x = +80;
-					else if (buttons & KEY_LEFT)
-						status.stick.x = -80;
-					else
-						status.stick.x = 0;
-
-					if (buttons & KEY_UP)
-						status.stick.y = +80;
-					else if (buttons & KEY_DOWN)
-						status.stick.y = -80;
-					else
-						status.stick.y = 0;
-					#endif
-
-					SISetResponse(&status, sizeof(status) * 8);
-				}
-				break;
-			case CMD_READ:
+			case CMD_GBREAD:
+				/* RAW: 03 21 - 13 CC LL */
 				if (length == 25) {
-					uint16_t address   = (buffer[2] | buffer[1] << 8) & ~0x1F;
-					if (crc5(address) != (buffer[2] & 0x1F)) break;
-
-					buffer[35] = pak_copyfrom(address, &buffer[3],
-						(address & 0x8000) == 0x8000 && rumble ? 0x81 : 0xFF);
-
-					SISetResponse(&buffer[3], 264);
+					/* 0x21 bytes to send */
+					if (buffer[1] == 0xC0)
+					{
+						/* Communication Status */
+						SISetResponse(&buffer[LINK_REP_C0], 264);
+					}
+					else if (buffer[1] == 0xF0)
+					{
+						/* Game Boy Link Communication Recv */
+						SISetResponse(&buffer[LINK_REP_F0], 264);
+					}
 				}
 				break;
-			case CMD_WRITE:
+			case CMD_GBWRITE:
+				/* RAW: 23 01 - 14 CC LL */
 				if (length == 281) {
-					uint16_t address   = (buffer[2] | buffer[1] << 8) & ~0x1F;
-					if (crc5(address) != (buffer[2] & 0x1F)) break;
+					/* 0x01 byte to send */
+					buffer[LINK_SEND + 0x20] = crc8(&buffer[LINK_SEND]);
+					SISetResponse(&buffer[LINK_SEND + 0x20], 8);
 
-					buffer[35] = pak_copyto(address, &buffer[3]);
-
-					SISetResponse(&buffer[35], 8);
-
-					if ((address & 0x8000) == 0x8000 && has_motor())
-						set_motor(buffer[3] & 0x01);
+					/* Prepare Data Response */
+					if (buffer[1] == 0x80) {
+						/* Initialization Command */
+						for (int i = 0; i < sizeof(buffer); i++)
+							buffer[i] = 0;
+					}
+					else if (buffer[1] == 0xC0) {
+						/* Communication Configuration Command */
+						buffer[LINK_REP_C0] = 0x02;
+						buffer[LINK_REP_C0 + 0x20] = crc8(&buffer[LINK_REP_C0]);
+					}
+					else if (buffer[1] == 0xE0) {
+						/* Game Boy Link Communication Send */
+						buffer[LINK_REP_F0 + 8] = 0x81;
+						buffer[LINK_REP_F0 + 0x20] = crc8(&buffer[LINK_REP_F0]);
+					}
 				}
 				break;
 		}
