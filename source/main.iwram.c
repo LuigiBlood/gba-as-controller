@@ -64,91 +64,7 @@ static struct {
 	uint8_t status;
 } id = {0x0300, 0x00};	/* 64GB Cable (Game Boy Printer Cartridge) */
 
-static struct {
-	struct {
-		uint16_t right   : 1;
-		uint16_t left    : 1;
-		uint16_t down    : 1;
-		uint16_t up      : 1;
-		uint16_t start   : 1;
-		uint16_t z       : 1;
-		uint16_t b       : 1;
-		uint16_t a       : 1;
-		uint16_t c_right : 1;
-		uint16_t c_left  : 1;
-		uint16_t c_down  : 1;
-		uint16_t c_up    : 1;
-		uint16_t r       : 1;
-		uint16_t l       : 1;
-		uint16_t         : 1;
-		uint16_t reset   : 1;
-	} buttons;
-
-	struct { int8_t x, y; } stick;
-} status;
-
 static uint8_t buffer[128];
-
-static enum {
-	RUMBLE_NONE = 0,
-	RUMBLE_GBA,
-	RUMBLE_NDS,
-	RUMBLE_NDS_EZCARD,
-	RUMBLE_NDS_SLIDE,
-} rumble;
-
-static bool has_motor(void)
-{
-	switch (ROM[0x59]) {
-		case 0x59:
-			switch (ROM[0xFFFFFF]) {
-				case ~0x0002:
-					rumble = RUMBLE_NDS;
-					return true;
-				case ~0x0101:
-					rumble = RUMBLE_NDS_SLIDE;
-					return true;
-			}
-			break;
-		case 0x96:
-			switch (ROM[0x56] & 0xFF) {
-				case 'G': case 'R': case 'V':
-					rumble = RUMBLE_GBA;
-					return true;
-			}
-			break;
-		case ~0x0002:
-			rumble = RUMBLE_NDS_EZCARD;
-			return true;
-	}
-
-	rumble = RUMBLE_NONE;
-	return false;
-}
-
-static void set_motor(bool enable)
-{
-	switch (rumble) {
-		case RUMBLE_NONE:
-			break;
-		case RUMBLE_GBA:
-			ROM_GPIODIR  =      1 << 3;
-			ROM_GPIODATA = enable << 3;
-			break;
-		case RUMBLE_NDS:
-			if (enable)
-				DMA3COPY(SRAM, SRAM, DMA_VBLANK | DMA_REPEAT | 1)
-			else
-				REG_DMA3CNT &= ~DMA_REPEAT;
-			break;
-		case RUMBLE_NDS_EZCARD:
-			ROM[0x000800] = enable << 1;
-			break;
-		case RUMBLE_NDS_SLIDE:
-			*ROM = enable << 8;
-			break;
-	}
-}
 
 uint8_t crc8_lut[256] = {
 	0x00, 0x85, 0x8F, 0x0A, 0x9B, 0x1E, 0x14, 0x91, 0xB3, 0x36, 0x3C, 0xB9, 0x28, 0xAD, 0xA7, 0x22,
@@ -176,51 +92,6 @@ static uint8_t crc8(uint8_t* ptr) {
 		crc ^= *ptr++;
 		crc  = crc8_lut[crc];
 	}
-
-	return crc;
-}
-
-static uint8_t pak_copyto(uint16_t addr, uint8_t *src)
-{
-	uint16_t *dst = (uint16_t *)VRAM + addr;
-	uint8_t crc = 0;
-
-	for (int i = 0; i < 32; i++) {
-		crc ^= *dst++ = *src++;
-		crc  = crc8_lut[crc];
-	}
-
-	return crc;
-}
-
-static uint8_t pak_copyfrom(uint16_t addr, uint8_t *dst, uint8_t mask)
-{
-	uint16_t *src = (uint16_t *)VRAM + addr;
-	uint8_t crc = 0;
-
-	for (int i = 0; i < 32; i++) {
-		crc ^= *dst++ = *src++ & mask;
-		crc  = crc8_lut[crc];
-	}
-
-	return crc;
-}
-
-uint8_t crc5_lut[32] = {
-	0x00, 0x15, 0x1F, 0x0A, 0x0B, 0x1E, 0x14, 0x01,
-	0x16, 0x03, 0x09, 0x1C, 0x1D, 0x08, 0x02, 0x17,
-	0x19, 0x0C, 0x06, 0x13, 0x12, 0x07, 0x0D, 0x18,
-	0x0F, 0x1A, 0x10, 0x05, 0x04, 0x11, 0x1B, 0x0E,
-};
-
-static uint8_t crc5(uint16_t addr)
-{
-	uint8_t crc = addr & 0x8000 ? 0x15 : 0;
-
-	crc ^= (addr >> 10) & 0x1F;
-	crc  = crc5_lut[crc];
-	crc ^= (addr >> 5) & 0x1F;
-	crc  = crc5_lut[crc];
 
 	return crc;
 }
